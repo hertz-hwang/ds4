@@ -17,6 +17,30 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
 LDLIBS ?= -lm -pthread
+
+# WebP intake is optional.  ds4_image.c compiles the libwebp path only when the
+# library is discoverable, so hosts without it keep building and refuse WebP
+# inputs with an explicit message instead of failing to link.  Force it either
+# way with DS4_WEBP=0/1; on hosts without pkg-config set WEBP_CFLAGS and
+# WEBP_LIBS by hand and use DS4_WEBP=1.
+DS4_WEBP ?= $(shell pkg-config --exists libwebp 2>/dev/null && echo 1 || echo 0)
+ifeq ($(DS4_WEBP),1)
+WEBP_CFLAGS ?= $(shell pkg-config --cflags libwebp 2>/dev/null)
+WEBP_LIBS ?= $(shell pkg-config --libs libwebp 2>/dev/null)
+endif
+ifneq ($(strip $(WEBP_CFLAGS)$(WEBP_LIBS)),)
+DS4_WEBP_FLAGS := -DDS4_HAVE_WEBP=1
+WEBP_LDLIBS := $(WEBP_LIBS)
+CFLAGS += $(DS4_WEBP_FLAGS) $(WEBP_CFLAGS)
+# Every binary links ds4_image.o, so the library belongs in the base link set.
+# CUDA_LDLIBS and ROCM_LDLIBS are written out independently of LDLIBS and name
+# it themselves, as does the one test target that links against a bare -lm.
+LDLIBS += $(WEBP_LDLIBS)
+else
+DS4_WEBP_FLAGS :=
+WEBP_LDLIBS :=
+endif
+
 METAL_SRCS := $(wildcard metal/*.metal)
 ROCM_SRCS := $(wildcard rocm/*.cuh)
 DS4_TEST_MODEL ?= ds4flash.gguf
@@ -55,12 +79,12 @@ MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_engram.o $(MMQ_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
-CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas $(WEBP_LDLIBS)
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_HOST_CFLAGS ?= -fPIC
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -lrocblas
+ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -lrocblas $(WEBP_LDLIBS)
 ROCM_MMQ_Y ?= 64
 ROCM_MMQ_FLAGS := $(ROCM_CFLAGS) -std=c++17 -DGGML_USE_HIP -DDS4_HIP_MMQ_Y=$(ROCM_MMQ_Y) $(MMQ_INCLUDES)
 ROCM_MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq/quantize.rocm.o cuda/mmq/mmid.rocm.o cuda/mmq/mmvq.rocm.o cuda/mmq/d2r_stubs.rocm.o
@@ -606,7 +630,7 @@ tests/test_deepseek4_vision_image.o: tests/test_deepseek4_vision_image.c ds4_ima
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 tests/test_deepseek4_vision_image: tests/test_deepseek4_vision_image.o ds4_image.o
-	$(CC) $(CFLAGS) -o $@ $^ -lm
+	$(CC) $(CFLAGS) -o $@ $^ -lm $(WEBP_LDLIBS)
 
 ifeq ($(UNAME_S),Darwin)
 $(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_metal.o ds4_image.o

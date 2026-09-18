@@ -447,13 +447,23 @@ typedef struct {
     server_image_input *v;
     size_t len;
     size_t cap;
+    /* Why an image was refused, when one was.  The JSON around it parsed
+     * correctly, so this has to reach the client instead of the generic
+     * "invalid JSON request" the parsers otherwise report.  It borrows a
+     * string literal, so it outlives the bytes it describes. */
+    const char *reject;
 } server_image_inputs;
 
 static void server_image_inputs_free(server_image_inputs *images) {
     if (!images) return;
+    /* The refusal reason is a borrowed literal rather than owned storage, so it
+     * survives the reset: intake frees the container on the very path where
+     * the parser still needs to say why it failed. */
+    const char *reject = images->reject;
     for (size_t i = 0; i < images->len; i++) free(images->v[i].encoded);
     free(images->v);
     memset(images, 0, sizeof(*images));
+    images->reject = reject;
 }
 
 static int base64_value(unsigned char c) {
@@ -495,21 +505,37 @@ static bool server_decode_base64(const char *src, uint8_t **out, size_t *out_len
     return true;
 }
 
+/* Intake reasons worth reporting verbatim: both are the client's to fix, and
+ * neither is the malformed JSON the parsers' shared failure label implies. */
+#define SERVER_IMAGE_REJECT_MEDIA \
+    "image input must be a PNG, JPEG, or WebP data URI"
+#define SERVER_IMAGE_REJECT_BASE64 \
+    "image input base64 payload is malformed"
+
+/* Mirrors the containers ds4_image_decode_memory can sniff.  WebP is admitted
+ * even in a build without libwebp so the refusal names the missing dependency
+ * instead of blaming the payload's shape. */
 static bool server_image_media_type(const char *media_type) {
     return media_type &&
            (!strcasecmp(media_type, "image/png") ||
             !strcasecmp(media_type, "image/jpeg") ||
-            !strcasecmp(media_type, "image/jpg"));
+            !strcasecmp(media_type, "image/jpg") ||
+            !strcasecmp(media_type, "image/webp"));
 }
 
 static bool server_image_inputs_push_base64(server_image_inputs *images,
                                             const char *media_type,
                                             const char *base64,
                                             char marker[SERVER_IMAGE_MARKER_BYTES]) {
-    if (!server_image_media_type(media_type)) return false;
-    server_image_input image = {0};
-    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
+    if (!server_image_media_type(media_type)) {
+        images->reject = SERVER_IMAGE_REJECT_MEDIA;
         return false;
+    }
+    server_image_input image = {0};
+    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len)) {
+        images->reject = SERVER_IMAGE_REJECT_BASE64;
+        return false;
+    }
     unsigned char nonce[12];
     if (!random_bytes(nonce, sizeof(nonce))) {
         uint64_t fallback = (uint64_t)time(NULL) ^
@@ -543,7 +569,11 @@ static bool server_image_inputs_push_data_uri(
     static const char png[] = "data:image/png;base64,";
     static const char jpeg[] = "data:image/jpeg;base64,";
     static const char jpg[] = "data:image/jpg;base64,";
-    if (!uri) return false;
+    static const char webp[] = "data:image/webp;base64,";
+    if (!uri) {
+        images->reject = SERVER_IMAGE_REJECT_MEDIA;
+        return false;
+    }
     if (!strncmp(uri, png, sizeof(png) - 1))
         return server_image_inputs_push_base64(
             images, "image/png", uri + sizeof(png) - 1, marker);
@@ -553,6 +583,10 @@ static bool server_image_inputs_push_data_uri(
     if (!strncmp(uri, jpg, sizeof(jpg) - 1))
         return server_image_inputs_push_base64(
             images, "image/jpg", uri + sizeof(jpg) - 1, marker);
+    if (!strncmp(uri, webp, sizeof(webp) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/webp", uri + sizeof(webp) - 1, marker);
+    images->reject = SERVER_IMAGE_REJECT_MEDIA;
     return false;
 }
 
@@ -773,7 +807,28 @@ typedef struct {
     chat_msg *v;
     int len;
     int cap;
+    /* First image-intake refusal seen while filling this history, kept here
+     * because the message or item that carried it is freed on the way out. */
+    const char *image_reject;
 } chat_msgs;
+
+/* Keep the first refusal so the parser can name the real cause; a later
+ * malformed-image payload must not overwrite an earlier, more specific one. */
+static void chat_msgs_record_reject(chat_msgs *msgs,
+                                    const server_image_inputs *images) {
+    if (!msgs || !images || msgs->image_reject || !images->reject) return;
+    msgs->image_reject = images->reject;
+}
+
+/* The shared failure label of every request parser.  Structurally broken JSON
+ * really is an "invalid JSON request", but a history that parsed cleanly and
+ * carried an unacceptable image is not, and the client can only act on the
+ * truth.  Must run before the history is freed. */
+static void report_parse_failure(const chat_msgs *msgs, char *err, size_t errlen) {
+    snprintf(err, errlen, "%s",
+             msgs && msgs->image_reject ? msgs->image_reject
+                                        : "invalid JSON request");
+}
 
 static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
                                            tool_replay_stats *stats);
@@ -2137,6 +2192,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         json_ws(p);
         continue;
 fail:
+        chat_msgs_record_reject(msgs, &msg.images);
         chat_msg_free(&msg);
         return false;
     }
@@ -2460,6 +2516,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         json_ws(p);
         continue;
 fail:
+        chat_msgs_record_reject(msgs, &msg.images);
         chat_msg_free(&msg);
         return false;
     }
@@ -4284,9 +4341,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     free(tool_schemas);
     return true;
 bad:
+    report_parse_failure(&msgs, err, errlen);
     chat_msgs_free(&msgs);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -4513,10 +4570,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     free(tool_schemas);
     return true;
 bad:
+    report_parse_failure(&msgs, err, errlen);
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -4883,6 +4940,8 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msgs_record_reject(msgs, &content_images);
+            chat_msgs_record_reject(msgs, &output_images);
             server_image_inputs_free(&content_images);
             server_image_inputs_free(&output_images);
             buf_free(&pending_reasoning);
@@ -4904,6 +4963,8 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msgs_record_reject(msgs, &content_images);
+            chat_msgs_record_reject(msgs, &output_images);
             server_image_inputs_free(&content_images);
             server_image_inputs_free(&output_images);
             goto fail;
@@ -4933,6 +4994,8 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msgs_record_reject(msgs, &content_images);
+            chat_msgs_record_reject(msgs, &output_images);
             server_image_inputs_free(&content_images);
             server_image_inputs_free(&output_images);
             buf_free(&pending_reasoning);
@@ -4957,6 +5020,8 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msgs_record_reject(msgs, &content_images);
+            chat_msgs_record_reject(msgs, &output_images);
             server_image_inputs_free(&content_images);
             server_image_inputs_free(&output_images);
             buf_free(&pending_reasoning);
@@ -5162,6 +5227,8 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_msgs_record_reject(msgs, &content_images);
+            chat_msgs_record_reject(msgs, &output_images);
             server_image_inputs_free(&content_images);
             server_image_inputs_free(&output_images);
             buf_free(&pending_reasoning);
@@ -5547,11 +5614,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     free(tool_schemas);
     return true;
 bad:
+    report_parse_failure(&msgs, err, errlen);
     chat_msgs_free(&msgs);
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -21694,6 +21761,118 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+static const char test_inline_webp_base64[] =
+    "UklGRkoAAABXRUJQVlA4TD4AAAAvA8AAAH9AkG0ziOMMf2iHEAumeHdMiQWTM4v5"
+    "c0Uy/21YFUIwWZYxDzIQBEDEOXDgwKcDBw6kRPQ/fI1FAA==";
+
+/* WebP is the format a browser-quality screenshotter hands over, so all three
+ * API shapes have to admit it: OpenAI content parts, Anthropic image sources,
+ * and Responses input_image items. */
+static void test_inline_webp_content_across_apis(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"text\","
+        "\"text\":\"describe \"},{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/webp;base64,");
+    buf_puts(&json, test_inline_webp_base64);
+    buf_puts(&json, "\"}},{\"type\":\"text\",\"text\":\" please\"}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    if (msgs.len == 1) {
+        TEST_ASSERT(msgs.v[0].images.len == 1);
+        TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "RIFF", 4));
+    }
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    json = (buf){0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image\","
+        "\"source\":{\"type\":\"base64\",\"media_type\":\"image/webp\","
+        "\"data\":\"");
+    buf_puts(&json, test_inline_webp_base64);
+    buf_puts(&json, "\"}},{\"type\":\"text\",\"text\":\"describe\"}]}]");
+    p = json.ptr;
+    msgs = (chat_msgs){0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    if (msgs.len == 1) TEST_ASSERT(msgs.v[0].images.len == 1);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+
+    json = (buf){0};
+    buf_puts(&json,
+        "[{\"type\":\"input_text\",\"text\":\"describe \"},"
+        "{\"type\":\"input_image\",\"image_url\":\"data:image/webp;base64,");
+    buf_puts(&json, test_inline_webp_base64);
+    buf_puts(&json, "\"}]");
+    p = json.ptr;
+    char *content = NULL;
+    server_image_inputs images = {0};
+    TEST_ASSERT(parse_responses_content_array_multimodal(&p, &content, &images));
+    TEST_ASSERT(images.len == 1);
+    TEST_ASSERT(images.reject == NULL);
+    TEST_ASSERT(content != NULL && strstr(content, "describe ") == content);
+    free(content);
+    server_image_inputs_free(&images);
+    buf_free(&json);
+}
+
+/* An image intake refusal is not a malformed request.  A payload that clears
+ * intake keeps going and only stops at tokenization with the --vision notice,
+ * which is what makes these assertions distinguish the two failures. */
+static void test_image_intake_names_the_real_cause(void) {
+    request r;
+    char err[160] = {0};
+    const char *gif = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
+    buf json = {0};
+    buf_puts(&json,
+        "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":"
+        "\"image_url\",\"image_url\":{\"url\":\"data:image/gif;base64,");
+    buf_puts(&json, gif);
+    buf_puts(&json, "\"}}]}]}");
+    bool ok = parse_chat_request(NULL, NULL, json.ptr, 1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "PNG, JPEG, or WebP") != NULL);
+    buf_free(&json);
+
+    json = (buf){0};
+    buf_puts(&json,
+        "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":"
+        "\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,"
+        "not_base64!!\"}}]}]}");
+    ok = parse_chat_request(NULL, NULL, json.ptr, 1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "base64") != NULL);
+    buf_free(&json);
+
+    json = (buf){0};
+    buf_puts(&json,
+        "{\"model\":\"deepseek-v4-flash\",\"max_output_tokens\":1,\"input\":"
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\","
+        "\"image_url\":\"data:image/webp;base64,");
+    buf_puts(&json, test_inline_webp_base64);
+    buf_puts(&json, "\"}]}]}");
+    ok = parse_responses_request(NULL, NULL, json.ptr, 1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "--vision") != NULL);
+    buf_free(&json);
+
+    json = (buf){0};
+    buf_puts(&json,
+        "{\"model\":\"deepseek-v4-flash\",\"max_output_tokens\":1,\"input\":"
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\","
+        "\"image_url\":\"data:image/gif;base64,");
+    buf_puts(&json, gif);
+    buf_puts(&json, "\"}]}]}");
+    ok = parse_responses_request(NULL, NULL, json.ptr, 1, 100, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "PNG, JPEG, or WebP") != NULL);
+    buf_free(&json);
+}
+
 static void test_visible_image_key(void) {
     char markers[2][SERVER_IMAGE_MARKER_BYTES] = {"nonce_A", "nonce_B"};
     request req = {.image_count = 1, .image_markers = markers};
@@ -22134,6 +22313,8 @@ static void ds4_server_unit_tests_run(void) {
     test_http_image_paths_and_urls_are_rejected();
     test_anthropic_inline_image_content();
     test_responses_inline_image_content();
+    test_inline_webp_content_across_apis();
+    test_image_intake_names_the_real_cause();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();

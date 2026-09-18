@@ -12,6 +12,13 @@
 #include "third_party/iris/jpeg.h"
 #include "third_party/iris/png.h"
 
+#ifdef DS4_HAVE_WEBP
+#include <webp/decode.h>
+#define DS4_IMAGE_FORMAT_HINT "image must be JPEG, PNG, or WebP"
+#else
+#define DS4_IMAGE_FORMAT_HINT "image must be JPEG or PNG"
+#endif
+
 typedef struct {
     uint32_t state[8];
     uint64_t bytes;
@@ -231,6 +238,48 @@ static int ds4_oriented_rgb(
     return 1;
 }
 
+#ifdef DS4_HAVE_WEBP
+/* WebP intake mirrors PNG intake: the RGB plane is kept and alpha dropped,
+ * because the vision tower consumes RGB and a shared convention keeps decoded
+ * frames comparable across formats.  Header features are read before decoding
+ * so an animated container or an absurd frame size is refused without letting
+ * libwebp allocate it first. */
+static int ds4_decode_webp(
+        ds4_image *out,
+        const uint8_t *encoded,
+        size_t len,
+        char *error,
+        size_t error_cap) {
+    WebPBitstreamFeatures features;
+    if (WebPGetFeatures(encoded, len, &features) != VP8_STATUS_OK) {
+        ds4_image_error(error, error_cap, "invalid or unsupported WebP image");
+        return 0;
+    }
+    if (features.has_animation) {
+        ds4_image_error(error, error_cap, "animated WebP image is not supported");
+        return 0;
+    }
+    if (features.width <= 0 || features.height <= 0 ||
+        (uint32_t)features.width > DS4_IMAGE_MAX_DIMENSION ||
+        (uint32_t)features.height > DS4_IMAGE_MAX_DIMENSION ||
+        (uint64_t)(uint32_t)features.width * (uint32_t)features.height >
+            DS4_IMAGE_MAX_PIXELS) {
+        ds4_image_error(error, error_cap, "WebP image exceeds the decode limits");
+        return 0;
+    }
+    int width = 0, height = 0;
+    uint8_t *rgba = WebPDecodeRGBA(encoded, len, &width, &height);
+    if (!rgba) {
+        ds4_image_error(error, error_cap, "invalid or unsupported WebP image");
+        return 0;
+    }
+    int ok = ds4_oriented_rgb(out, rgba, (uint32_t)width, (uint32_t)height, 4, 1);
+    WebPFree(rgba);
+    if (!ok) ds4_image_error(error, error_cap, "unable to allocate decoded WebP pixels");
+    return ok;
+}
+#endif
+
 int ds4_image_decode_memory(
         ds4_image *out,
         const uint8_t *encoded,
@@ -275,7 +324,19 @@ int ds4_image_decode_memory(
         return ok;
     }
 
-    ds4_image_error(error, error_cap, "image must be JPEG or PNG");
+    if (encoded_len >= 12 &&
+        memcmp(encoded, "RIFF", 4) == 0 &&
+        memcmp(encoded + 8, "WEBP", 4) == 0) {
+#ifdef DS4_HAVE_WEBP
+        return ds4_decode_webp(out, encoded, encoded_len, error, error_cap);
+#else
+        ds4_image_error(error, error_cap,
+                        "WebP image requires building ds4 with libwebp");
+        return 0;
+#endif
+    }
+
+    ds4_image_error(error, error_cap, DS4_IMAGE_FORMAT_HINT);
     return 0;
 }
 
